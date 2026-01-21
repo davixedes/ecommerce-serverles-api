@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless E-Commerce with Event-Driven Architecture - COM Datadog APM
+
+Parameters:
+  DatadogApiKey:
+    Type: String
+    NoEcho: true
+    Default: "YOUR_DATADOG_API_KEY_HERE"
+    Description: Datadog API Key - Substitua YOUR_DATADOG_API_KEY_HERE pela sua chave real
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.11
+    MemorySize: 1024
+    Environment:
+      Variables:
+        PRODUCTS_TABLE: !Ref ProductsTable
+        ORDERS_TABLE: !Ref OrdersTable
+        POWERTOOLS_SERVICE_NAME: ecommerce
+        LOG_LEVEL: INFO
+        # Datadog Environment Variables
+        DD_API_KEY: !Ref DatadogApiKey
+        DD_SITE: datadoghq.com
+        DD_ENV: production
+        DD_SERVICE: ecommerce-api
+        DD_VERSION: "1.0.0"
+        DD_TRACE_ENABLED: true
+        DD_LOGS_INJECTION: true
+        DD_SERVERLESS_LOGS_ENABLED: true
+        DD_ENHANCED_METRICS: true
+        DD_MERGE_XRAY_TRACES: true
+    Layers:
+      # Datadog Lambda Extension Layer (us-east-1)
+      # Atualizar versão conforme necessário: https://docs.datadoghq.com/serverless/libraries_integrations/extension/
+      - arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Extension:65
+      # Datadog Python Layer (Python 3.11)
+      - arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Python311:115
+
+Resources:
+  # DynamoDB Tables
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ecommerce-products
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: product_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: product_id
+          KeyType: HASH
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ecommerce-orders
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # SNS Topics
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecommerce-order-events
+      DisplayName: Order Events Topic
+
+  PaymentEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecommerce-payment-events
+      DisplayName: Payment Events Topic
+
+  # SQS Queues
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-inventory-queue
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InventoryDLQ.Arn
+        maxReceiveCount: 3
+
+  InventoryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-inventory-dlq
+      MessageRetentionPeriod: 1209600
+
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-email-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailDLQ.Arn
+        maxReceiveCount: 3
+
+  EmailDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-email-dlq
+
+  FraudQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-fraud-queue
+      VisibilityTimeout: 120
+
+  # SNS Subscriptions
+  EmailQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt EmailQueue.Arn
+      FilterPolicy:
+        event_type:
+          - order_confirmed
+          - order_shipped
+
+  FraudQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref PaymentEventsTopic
+      Endpoint: !GetAtt FraudQueue.Arn
+      RawMessageDelivery: true
+
+  # SQS Policies
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmailQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EmailQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  FraudQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FraudQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FraudQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref PaymentEventsTopic
+
+  # API Gateway
+  EcommerceApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - "*"
+
+  # Lambda Functions
+
+  # Products API - COM Datadog
+  ProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/products/
+      Handler: datadog_lambda.handler.handler  # Datadog handler wrapper
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler  # Seu handler original
+          DD_SERVICE: ecommerce-products
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        ListProducts:
+          Type: HttpApi
+          Properties:
+            Path: /products
+            Method: GET
+            ApiId: !Ref EcommerceApi
+        GetProduct:
+          Type: HttpApi
+          Properties:
+            Path: /products/{product_id}
+            Method: GET
+            ApiId: !Ref EcommerceApi
+
+  # ⚠️ FUNÇÃO PROBLEMÁTICA - Order Processing - AGORA COM Datadog para debug!
+  OrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/orders/
+      Handler: datadog_lambda.handler.handler  # Datadog handler wrapper
+      # ⚠️ Timeout ainda baixo para demonstrar problema
+      Timeout: 5
+      # ⚠️ Memory ainda baixa
+      MemorySize: 128
+      # ✅ AGORA COM Datadog Layers!
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler  # Seu handler original
+          INVENTORY_QUEUE_URL: !GetAtt InventoryQueue.QueueUrl
+          ORDER_EVENTS_TOPIC_ARN: !Ref OrderEventsTopic
+          PAYMENT_EVENTS_TOPIC_ARN: !Ref PaymentEventsTopic
+          PAYMENT_API_URL: https://httpbin.org/delay/dynamic
+          DD_SERVICE: ecommerce-orders
+          # ✅ Datadog configurado para capturar cold starts e payment latency
+          DD_TRACE_SAMPLE_RATE: "1"  # 100% sampling para debug
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InventoryQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderEventsTopic.TopicName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt PaymentEventsTopic.TopicName
+      Events:
+        CreateOrder:
+          Type: HttpApi
+          Properties:
+            Path: /orders
+            Method: POST
+            ApiId: !Ref EcommerceApi
+        GetOrders:
+          Type: HttpApi
+          Properties:
+            Path: /orders
+            Method: GET
+            ApiId: !Ref EcommerceApi
+
+  # Inventory Management (Async) - COM Datadog
+  InventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/inventory/
+      Handler: datadog_lambda.handler.handler
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler
+          DD_SERVICE: ecommerce-inventory
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        InventoryQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InventoryQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+
+  # Email Notifications (Async) - COM Datadog
+  EmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/email/
+      Handler: datadog_lambda.handler.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler
+          FROM_EMAIL: noreply@ecommerce-demo.com
+          DD_SERVICE: ecommerce-email
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        EmailQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailQueue.Arn
+            BatchSize: 10
+
+  # Analytics (Async) - COM Datadog
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/analytics/
+      Handler: datadog_lambda.handler.handler
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler
+          DD_SERVICE: ecommerce-analytics
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        OrderCreated:
+          Type: SNS
+          Properties:
+            Topic: !Ref OrderEventsTopic
+            FilterPolicy:
+              event_type:
+                - order_created
+
+  # Fraud Detection (Async) - COM Datadog
+  FraudFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/fraud/
+      Handler: datadog_lambda.handler.handler
+      Timeout: 120
+      MemorySize: 2048
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler
+          RISK_THRESHOLD: "0.7"
+          DD_SERVICE: ecommerce-fraud
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        FraudQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FraudQueue.Arn
+            BatchSize: 5
+
+  # DynamoDB Stream Processor - COM Datadog
+  OrderStreamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/stream_processor/
+      Handler: datadog_lambda.handler.handler
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: handler.lambda_handler
+          DD_SERVICE: ecommerce-stream-processor
+      Policies:
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref OrdersTable
+            StreamName: !GetAtt OrdersTable.StreamArn
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt OrdersTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 10
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${EcommerceApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  OrderEventsTopicArn:
+    Description: "Order Events SNS Topic ARN"
+    Value: !Ref OrderEventsTopic
+
+  InventoryQueueUrl:
+    Description: "Inventory Queue URL"
+    Value: !GetAtt InventoryQueue.QueueUrl
+
+  DatadogInstrumentation:
+    Description: "Datadog APM está ativo"
+    Value: "Todas as funções estão instrumentadas com Datadog"

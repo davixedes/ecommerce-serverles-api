@@ -10,8 +10,7 @@ import os
 import boto3
 from decimal import Decimal
 
-# ✅ Datadog
-#from datadog_lambda.wrapper import datadog_lambda_wrapper
+# ✅ Datadog (configurado via Handler Redirection no template)
 
 dynamodb = boto3.resource('dynamodb')
 table_name = os.environ['PRODUCTS_TABLE']
@@ -25,7 +24,6 @@ class DecimalEncoder(json.JSONEncoder):
         return super(DecimalEncoder, self).default(obj)
 
 
-#@datadog_lambda_wrapper
 def lambda_handler(event, context):
     """
     GET /products - List all products

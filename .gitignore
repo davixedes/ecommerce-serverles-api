@@ -42,6 +42,7 @@ env/
 # Environment variables
 .env
 .env.local
+.env.datadog
 
 # Logs
 *.log

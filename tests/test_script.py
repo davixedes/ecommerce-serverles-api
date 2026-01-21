@@ -29,7 +29,7 @@ class Colors:
 
 
 class TestResult:
-    """Resultado de uma requisição"""
+    #Resultado de uma requisição
     def __init__(self):
         self.success = False
         self.status_code = None
@@ -38,7 +38,7 @@ class TestResult:
 
 
 def test_get_products(api_url: str) -> TestResult:
-    """Test GET /products"""
+    #Test GET /products
     result = TestResult()
     
     try:
