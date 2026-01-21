@@ -152,7 +152,6 @@ def run_load_test(api_url: str, num_requests: int = 100):
     print(f"{Colors.BOLD}{'='*80}{Colors.END}")
     print(f"{Colors.BOLD}[1/3] Testing GET /products{Colors.END}")
     print(f"{Colors.BOLD}{'='*80}{Colors.END}")
-    print(f"{Colors.YELLOW}Expected: ✅ Should work - Fast DynamoDB scan{Colors.END}\n")
     
     results_products = []
     
@@ -179,7 +178,7 @@ def run_load_test(api_url: str, num_requests: int = 100):
     print(f"\n{Colors.BOLD}{'='*80}{Colors.END}")
     print(f"{Colors.BOLD}[2/3] Testing GET /products/{{id}}{Colors.END}")
     print(f"{Colors.BOLD}{'='*80}{Colors.END}")
-    print(f"{Colors.YELLOW}Expected: ✅ Should work - Fast DynamoDB GetItem{Colors.END}\n")
+
     
     results_get_product = []
     
@@ -209,7 +208,6 @@ def run_load_test(api_url: str, num_requests: int = 100):
     print(f"\n{Colors.BOLD}{'='*80}{Colors.END}")
     print(f"{Colors.BOLD}[3/3] Testing POST /orders{Colors.END}")
     print(f"{Colors.BOLD}{'='*80}{Colors.END}")
-    print(f"{Colors.YELLOW}Expected: ❌ Should TIMEOUT - Cold start + Payment API > 5s{Colors.END}\n")
     
     results_orders = []
     

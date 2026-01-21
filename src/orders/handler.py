@@ -32,28 +32,15 @@ orders_table = dynamodb.Table(ORDERS_TABLE)
 products_table = dynamodb.Table(PRODUCTS_TABLE)
 
 
-# ⚠️ Simulando módulos pesados que causam cold start lento
-# Em aplicações reais: pandas, numpy, ML models, etc.
-# Cada import adiciona ~500ms ao cold start
-print("🥶 COLD START DETECTED - Loading heavy modules...")
-print("Loading heavy module 1 (pandas)...")
+# Simula imports pesados (pandas, numpy, ML models, etc.)
 time.sleep(0.5)
-print("Loading heavy module 2 (numpy)...")
 time.sleep(0.5)
-print("Loading heavy module 3 (ML models)...")
 time.sleep(0.5)
-print("Loading heavy module 4 (boto3 extras)...")
 time.sleep(0.5)
-print("Loading heavy module 5 (connection pools)...")
 time.sleep(0.5)
-print("Loading heavy module 6 (config/secrets)...")
 time.sleep(0.5)
 
-# Total: ~3 segundos de cold start!
 COLD_START_TIME = time.time()
-print(f"✅ All modules loaded - ready to process requests (Cold start: ~3s)")
-
-# Flag para rastrear se é cold start
 IS_COLD_START = True
 
 
@@ -66,29 +53,18 @@ class DecimalEncoder(json.JSONEncoder):
 
 
 def lambda_handler(event, context):
-    """
-    Handler principal - Order Management
-
-    COMPORTAMENTO ESPERADO:
-    - Cold start: SEMPRE falha com timeout/502 (Cold start 3s + Payment 3s = 6s > 5s timeout)
-    - Warm start: 85% sucesso, 15% falha esporádica (simula problemas intermitentes)
-
-    Isso gera ~15% de falha geral, mas concentrado em cold starts.
-    """
+    """Handler principal - Order Management"""
     global IS_COLD_START
 
     http_method = event['requestContext']['http']['method']
     path = event['rawPath']
 
-    # Detectar se é cold start (primeira execução após carregar módulos)
+    # Detectar se é cold start
     time_since_init = time.time() - COLD_START_TIME
-    is_cold = IS_COLD_START or time_since_init < 5  # Primeiros 5s após init
+    is_cold = IS_COLD_START or time_since_init < 5
 
     if is_cold:
-        print(f"🥶 COLD START REQUEST (time since init: {time_since_init:.2f}s)")
-        IS_COLD_START = False  # Próximas serão warm
-    else:
-        print(f"🔥 WARM START REQUEST")
+        IS_COLD_START = False
 
     try:
         # POST /orders - Create new order
@@ -116,20 +92,7 @@ def lambda_handler(event, context):
 
 
 def create_order(event, context, is_cold_start=False):
-    """
-    Cria novo pedido e processa pagamento
-
-    COMPORTAMENTO:
-    - Cold start: Payment API demora 3.5s + cold start 3s = 6.5s → TIMEOUT (limite 5s)
-    - Warm start: Payment API demora 0.8-1.5s, mas 15% das vezes demora 6s (timeout)
-
-    FLUXO:
-    1. Validar produtos no DynamoDB (~100ms)
-    2. Chamar Payment API (varia conforme cold/warm)
-    3. Salvar order no DynamoDB (~100ms)
-    4. Publicar evento SNS (~50ms)
-    5. Enviar mensagem SQS (~50ms)
-    """
+    """Cria novo pedido e processa pagamento"""
     
     # Parse request body
     body = json.loads(event.get('body', '{}'))
@@ -143,11 +106,8 @@ def create_order(event, context, is_cold_start=False):
         }
     
     print(f"Customer: {customer_id}, Items: {len(items)}")
-    
+
     # 1. Validar produtos no DynamoDB
-    print("Step 1: Validating products...")
-    start = time.time()
-    
     total_amount = Decimal('0')
     validated_items = []
     
@@ -176,40 +136,22 @@ def create_order(event, context, is_cold_start=False):
         
         total_amount += price * quantity
     
-    validation_time = time.time() - start
-    print(f"Products validated in {validation_time:.3f}s - Total: ${total_amount}")
-    
-    # 2. Processar pagamento (BOTTLENECK!)
-    print("Step 2: Processing payment...")
+    print(f"Validating products... Total: ${total_amount}")
 
+    # 2. Processar pagamento
+    print("Processing payment...")
     payment_start = time.time()
 
-    # ⚠️ LÓGICA DO PROBLEMA:
-    # - Cold start: Payment API sempre lento (3.5s) → Com cold start total = 6.5s → TIMEOUT!
-    # - Warm start: 85% rápido (0.8-1.5s), 15% lento (6s) → Falha esporádica
-
+    # Determinar URL da payment API
     if is_cold_start:
-        # Cold start: SEMPRE usa API lenta (httpbin.org/delay/3.5)
-        # Total: cold start 3s + payment 3.5s = 6.5s > 5s timeout = FALHA
         payment_url = "https://httpbin.org/delay/3.5"
-        print(f"🥶 COLD START: Using SLOW payment API (will timeout!)")
-        print(f"   Expected: 3.5s payment + 3s cold start = 6.5s > 5s timeout")
     else:
-        # Warm start: 15% de chance de usar API lenta (intermitente)
         is_intermittent_failure = random.random() < 0.15
-
         if is_intermittent_failure:
-            # 15% das vezes: API lenta causa timeout
             payment_url = "https://httpbin.org/delay/6"
-            print(f"⚠️ INTERMITTENT FAILURE: Using slow payment API (will timeout)")
-            print(f"   This is the 15% failure case")
         else:
-            # 85% das vezes: API rápida, sucesso
             delay = random.uniform(0.8, 1.5)
             payment_url = f"https://httpbin.org/delay/{delay:.1f}"
-            print(f"🔥 WARM START: Using fast payment API (~{delay:.1f}s)")
-
-    print(f"Calling: {payment_url}")
 
     try:
         payment_response = requests.post(
@@ -223,34 +165,31 @@ def create_order(event, context, is_cold_start=False):
         )
 
         payment_time = time.time() - payment_start
-        print(f"Payment processed in {payment_time:.3f}s")
+        print(f"Payment completed in {payment_time:.2f}s")
 
         if payment_response.status_code != 200:
-            print(f"Payment failed: {payment_response.status_code}")
             return {
                 'statusCode': 502,
                 'body': json.dumps({'error': 'Payment gateway error'})
             }
 
         payment_data = payment_response.json()
-        print(f"Payment successful: {payment_data}")
 
     except requests.Timeout:
-        print("❌ Payment API timeout!")
+        print("ERROR: Payment gateway timeout")
         return {
             'statusCode': 504,
             'body': json.dumps({'error': 'Payment gateway timeout'})
         }
 
     except Exception as e:
-        print(f"❌ Payment error: {str(e)}")
+        print(f"ERROR: {str(e)}")
         return {
             'statusCode': 502,
             'body': json.dumps({'error': 'Payment processing failed'})
         }
-    
+
     # 3. Salvar order no DynamoDB
-    print("Step 3: Saving order to DynamoDB...")
     
     order_id = str(uuid.uuid4())
     timestamp = int(time.time() * 1000)
@@ -267,10 +206,8 @@ def create_order(event, context, is_cold_start=False):
     }
     
     orders_table.put_item(Item=order)
-    print(f"Order saved: {order_id}")
-    
+
     # 4. Publicar evento no SNS
-    print("Step 4: Publishing to SNS...")
     
     sns.publish(
         TopicArn=ORDER_EVENTS_TOPIC_ARN,
@@ -287,22 +224,17 @@ def create_order(event, context, is_cold_start=False):
             }
         }
     )
-    
-    print("Event published to SNS")
-    
+
     # 5. Enviar mensagem para fila de inventário
-    print("Step 5: Sending message to SQS...")
-    
     sqs.send_message(
         QueueUrl=INVENTORY_QUEUE_URL,
         MessageBody=json.dumps({
             'order_id': order_id,
             'items': validated_items
-        })
+        }, cls=DecimalEncoder)
     )
-    
-    print("Message sent to inventory queue")
-    print(f"Order processing completed: {order_id}")
+
+    print(f"Order {order_id} created successfully")
     
     return {
         'statusCode': 201,
