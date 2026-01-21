@@ -11,6 +11,7 @@ import uuid
 import time
 import boto3
 import requests
+import random
 from decimal import Decimal
 from datetime import datetime
 
@@ -34,21 +35,26 @@ products_table = dynamodb.Table(PRODUCTS_TABLE)
 # ⚠️ Simulando módulos pesados que causam cold start lento
 # Em aplicações reais: pandas, numpy, ML models, etc.
 # Cada import adiciona ~500ms ao cold start
-print("Loading heavy module 1...")
-time.sleep(0.5)  # Simula import pandas
-print("Loading heavy module 2...")
-time.sleep(0.5)  # Simula import numpy
-print("Loading heavy module 3...")
-time.sleep(0.5)  # Simula ML model load
-print("Loading heavy module 4...")
-time.sleep(0.5)  # Simula other dependencies
-print("Loading heavy module 5...")
-time.sleep(0.5)  # Simula connection pools
-print("Loading heavy module 6...")
-time.sleep(0.5)  # Simula configuration load
+print("🥶 COLD START DETECTED - Loading heavy modules...")
+print("Loading heavy module 1 (pandas)...")
+time.sleep(0.5)
+print("Loading heavy module 2 (numpy)...")
+time.sleep(0.5)
+print("Loading heavy module 3 (ML models)...")
+time.sleep(0.5)
+print("Loading heavy module 4 (boto3 extras)...")
+time.sleep(0.5)
+print("Loading heavy module 5 (connection pools)...")
+time.sleep(0.5)
+print("Loading heavy module 6 (config/secrets)...")
+time.sleep(0.5)
 
 # Total: ~3 segundos de cold start!
-print("All modules loaded - ready to process requests")
+COLD_START_TIME = time.time()
+print(f"✅ All modules loaded - ready to process requests (Cold start: ~3s)")
+
+# Flag para rastrear se é cold start
+IS_COLD_START = True
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -62,40 +68,43 @@ class DecimalEncoder(json.JSONEncoder):
 def lambda_handler(event, context):
     """
     Handler principal - Order Management
-    
-    PROBLEMA:
-    - Cold start: ~3 segundos (imports pesados)
-    - Payment API: 6 segundos
-    - Total em cold start: 9 segundos
-    - Timeout configurado: 5 segundos
-    - Resultado: TIMEOUT em cold starts!
-    
-    Warm start funciona:
-    - Sem cold start: 0s
-    - Payment API: 6 segundos... ⚠️ ainda timeout!
-    
-    WAIT, na verdade SEMPRE dá timeout porque Payment API > 5s!
-    Mas em cold start é ainda PIOR.
+
+    COMPORTAMENTO ESPERADO:
+    - Cold start: SEMPRE falha com timeout/502 (Cold start 3s + Payment 3s = 6s > 5s timeout)
+    - Warm start: 85% sucesso, 15% falha esporádica (simula problemas intermitentes)
+
+    Isso gera ~15% de falha geral, mas concentrado em cold starts.
     """
-    
+    global IS_COLD_START
+
     http_method = event['requestContext']['http']['method']
     path = event['rawPath']
-    
+
+    # Detectar se é cold start (primeira execução após carregar módulos)
+    time_since_init = time.time() - COLD_START_TIME
+    is_cold = IS_COLD_START or time_since_init < 5  # Primeiros 5s após init
+
+    if is_cold:
+        print(f"🥶 COLD START REQUEST (time since init: {time_since_init:.2f}s)")
+        IS_COLD_START = False  # Próximas serão warm
+    else:
+        print(f"🔥 WARM START REQUEST")
+
     try:
         # POST /orders - Create new order
         if http_method == 'POST' and path == '/orders':
-            return create_order(event, context)
-        
+            return create_order(event, context, is_cold)
+
         # GET /orders - List orders
         elif http_method == 'GET' and path == '/orders':
             return list_orders(event)
-        
+
         else:
             return {
                 'statusCode': 400,
                 'body': json.dumps({'error': 'Invalid request'})
             }
-    
+
     except Exception as e:
         print(f"Error: {str(e)}")
         import traceback
@@ -106,19 +115,20 @@ def lambda_handler(event, context):
         }
 
 
-def create_order(event, context):
+def create_order(event, context, is_cold_start=False):
     """
     Cria novo pedido e processa pagamento
-    
+
+    COMPORTAMENTO:
+    - Cold start: Payment API demora 3.5s + cold start 3s = 6.5s → TIMEOUT (limite 5s)
+    - Warm start: Payment API demora 0.8-1.5s, mas 15% das vezes demora 6s (timeout)
+
     FLUXO:
     1. Validar produtos no DynamoDB (~100ms)
-    2. Chamar Payment API (~6000ms) ⚠️ BOTTLENECK
+    2. Chamar Payment API (varia conforme cold/warm)
     3. Salvar order no DynamoDB (~100ms)
     4. Publicar evento SNS (~50ms)
     5. Enviar mensagem SQS (~50ms)
-    
-    Total (warm): ~6.3s → TIMEOUT (limite 5s)!
-    Total (cold): ~9.3s → TIMEOUT AINDA PIOR!
     """
     
     # Parse request body
@@ -171,48 +181,71 @@ def create_order(event, context):
     
     # 2. Processar pagamento (BOTTLENECK!)
     print("Step 2: Processing payment...")
-    print(f"Calling payment API: {PAYMENT_API_URL}")
-    
+
     payment_start = time.time()
-    
+
+    # ⚠️ LÓGICA DO PROBLEMA:
+    # - Cold start: Payment API sempre lento (3.5s) → Com cold start total = 6.5s → TIMEOUT!
+    # - Warm start: 85% rápido (0.8-1.5s), 15% lento (6s) → Falha esporádica
+
+    if is_cold_start:
+        # Cold start: SEMPRE usa API lenta (httpbin.org/delay/3.5)
+        # Total: cold start 3s + payment 3.5s = 6.5s > 5s timeout = FALHA
+        payment_url = "https://httpbin.org/delay/3.5"
+        print(f"🥶 COLD START: Using SLOW payment API (will timeout!)")
+        print(f"   Expected: 3.5s payment + 3s cold start = 6.5s > 5s timeout")
+    else:
+        # Warm start: 15% de chance de usar API lenta (intermitente)
+        is_intermittent_failure = random.random() < 0.15
+
+        if is_intermittent_failure:
+            # 15% das vezes: API lenta causa timeout
+            payment_url = "https://httpbin.org/delay/6"
+            print(f"⚠️ INTERMITTENT FAILURE: Using slow payment API (will timeout)")
+            print(f"   This is the 15% failure case")
+        else:
+            # 85% das vezes: API rápida, sucesso
+            delay = random.uniform(0.8, 1.5)
+            payment_url = f"https://httpbin.org/delay/{delay:.1f}"
+            print(f"🔥 WARM START: Using fast payment API (~{delay:.1f}s)")
+
+    print(f"Calling: {payment_url}")
+
     try:
-        # ⚠️ Esta chamada demora 6 segundos!
-        # Com cold start de 3s, total = 9s
-        # Timeout é 5s, então sempre falha!
         payment_response = requests.post(
-            PAYMENT_API_URL,
+            payment_url,
             json={
                 'customer_id': customer_id,
                 'amount': float(total_amount),
                 'currency': 'USD'
             },
-            timeout=10  # Timeout do requests, não da Lambda
+            timeout=10  # Timeout do requests (não da Lambda)
         )
-        
+
         payment_time = time.time() - payment_start
         print(f"Payment processed in {payment_time:.3f}s")
-        
+
         if payment_response.status_code != 200:
             print(f"Payment failed: {payment_response.status_code}")
             return {
-                'statusCode': 402,
-                'body': json.dumps({'error': 'Payment failed'})
+                'statusCode': 502,
+                'body': json.dumps({'error': 'Payment gateway error'})
             }
-        
+
         payment_data = payment_response.json()
         print(f"Payment successful: {payment_data}")
-    
+
     except requests.Timeout:
-        print("Payment API timeout!")
+        print("❌ Payment API timeout!")
         return {
             'statusCode': 504,
             'body': json.dumps({'error': 'Payment gateway timeout'})
         }
-    
+
     except Exception as e:
-        print(f"Payment error: {str(e)}")
+        print(f"❌ Payment error: {str(e)}")
         return {
-            'statusCode': 500,
+            'statusCode': 502,
             'body': json.dumps({'error': 'Payment processing failed'})
         }
     

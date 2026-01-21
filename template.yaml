@@ -209,18 +209,20 @@ Resources:
     Properties:
       CodeUri: src/orders/
       Handler: handler.lambda_handler
-      # ⚠️ Timeout baixo (5s) + cold start pesado = problema!
+      # ⚠️ Timeout baixo (5s) + cold start pesado (3s) + payment lento (3.5s) = 6.5s > 5s = TIMEOUT!
       Timeout: 5
       # ⚠️ Memory baixa (128MB) força cold starts mais frequentes
       MemorySize: 128
-      # ❌ SEM Datadog Layers
+      # ❌ SEM Datadog Layers para observabilidade
       Environment:
         Variables:
           INVENTORY_QUEUE_URL: !GetAtt InventoryQueue.QueueUrl
           ORDER_EVENTS_TOPIC_ARN: !Ref OrderEventsTopic
           PAYMENT_EVENTS_TOPIC_ARN: !Ref PaymentEventsTopic
-          # ⚠️ Payment API com delay de 6 segundos
-          PAYMENT_API_URL: https://httpbin.org/delay/6
+          # ⚠️ Payment API dinâmico (httpbin.org/delay):
+          #    - Cold start: delay/3.5 (sempre timeout)
+          #    - Warm start: 85% delay/0.8-1.5 (sucesso), 15% delay/6 (timeout)
+          PAYMENT_API_URL: https://httpbin.org/delay/dynamic
           # ❌ SEM variáveis Datadog
       Policies:
         - DynamoDBCrudPolicy:
