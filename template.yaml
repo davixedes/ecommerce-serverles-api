@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless E-Commerce with Event-Driven Architecture - SEM Datadog
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.11
+    MemorySize: 1024
+    Environment:
+      Variables:
+        PRODUCTS_TABLE: !Ref ProductsTable
+        ORDERS_TABLE: !Ref OrdersTable
+        POWERTOOLS_SERVICE_NAME: ecommerce
+        LOG_LEVEL: INFO
+
+Resources:
+  # DynamoDB Tables
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ecommerce-products
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: product_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: product_id
+          KeyType: HASH
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ecommerce-orders
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # SNS Topics
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecommerce-order-events
+      DisplayName: Order Events Topic
+
+  PaymentEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecommerce-payment-events
+      DisplayName: Payment Events Topic
+
+  # SQS Queues
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-inventory-queue
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InventoryDLQ.Arn
+        maxReceiveCount: 3
+
+  InventoryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-inventory-dlq
+      MessageRetentionPeriod: 1209600
+
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-email-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailDLQ.Arn
+        maxReceiveCount: 3
+
+  EmailDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-email-dlq
+
+  FraudQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-fraud-queue
+      VisibilityTimeout: 120
+
+  # SNS Subscriptions
+  EmailQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt EmailQueue.Arn
+      FilterPolicy:
+        event_type:
+          - order_confirmed
+          - order_shipped
+
+  FraudQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref PaymentEventsTopic
+      Endpoint: !GetAtt FraudQueue.Arn
+      RawMessageDelivery: true
+
+  # SQS Policies
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmailQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EmailQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  FraudQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FraudQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FraudQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref PaymentEventsTopic
+
+  # API Gateway
+  EcommerceApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - "*"
+
+  # Lambda Functions
+  
+  # Products API
+  ProductsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/products/
+      Handler: handler.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        ListProducts:
+          Type: HttpApi
+          Properties:
+            Path: /products
+            Method: GET
+            ApiId: !Ref EcommerceApi
+        GetProduct:
+          Type: HttpApi
+          Properties:
+            Path: /products/{product_id}
+            Method: GET
+            ApiId: !Ref EcommerceApi
+
+  # ⚠️ FUNÇÃO PROBLEMÁTICA - Order Processing
+  OrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/orders/
+      Handler: handler.lambda_handler
+      # ⚠️ Timeout baixo (5s) + cold start pesado = problema!
+      Timeout: 5
+      # ⚠️ Memory baixa (128MB) força cold starts mais frequentes
+      MemorySize: 128
+      # ❌ SEM Datadog Layers
+      Environment:
+        Variables:
+          INVENTORY_QUEUE_URL: !GetAtt InventoryQueue.QueueUrl
+          ORDER_EVENTS_TOPIC_ARN: !Ref OrderEventsTopic
+          PAYMENT_EVENTS_TOPIC_ARN: !Ref PaymentEventsTopic
+          # ⚠️ Payment API com delay de 6 segundos
+          PAYMENT_API_URL: https://httpbin.org/delay/6
+          # ❌ SEM variáveis Datadog
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ProductsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InventoryQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderEventsTopic.TopicName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt PaymentEventsTopic.TopicName
+      Events:
+        CreateOrder:
+          Type: HttpApi
+          Properties:
+            Path: /orders
+            Method: POST
+            ApiId: !Ref EcommerceApi
+        GetOrders:
+          Type: HttpApi
+          Properties:
+            Path: /orders
+            Method: GET
+            ApiId: !Ref EcommerceApi
+
+  # Inventory Management (Async)
+  InventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/inventory/
+      Handler: handler.lambda_handler
+      ReservedConcurrentExecutions: 5
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProductsTable
+      Events:
+        InventoryQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InventoryQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+
+  # Email Notifications (Async)
+  EmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/email/
+      Handler: handler.lambda_handler
+      Timeout: 30
+      Environment:
+        Variables:
+          FROM_EMAIL: noreply@ecommerce-demo.com
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        EmailQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailQueue.Arn
+            BatchSize: 10
+
+  # Analytics (Async)
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/analytics/
+      Handler: handler.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        OrderCreated:
+          Type: SNS
+          Properties:
+            Topic: !Ref OrderEventsTopic
+            FilterPolicy:
+              event_type:
+                - order_created
+
+  # Fraud Detection (Async)
+  FraudFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/fraud/
+      Handler: handler.lambda_handler
+      Timeout: 120
+      MemorySize: 2048
+      Environment:
+        Variables:
+          RISK_THRESHOLD: "0.7"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        FraudQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FraudQueue.Arn
+            BatchSize: 5
+
+  # DynamoDB Stream Processor
+  OrderStreamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/stream_processor/
+      Handler: handler.lambda_handler
+      Policies:
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref OrdersTable
+            StreamName: !GetAtt OrdersTable.StreamArn
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt OrdersTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 10
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${EcommerceApi}.execute-api.${AWS::Region}.amazonaws.com"
+  
+  OrderEventsTopicArn:
+    Description: "Order Events SNS Topic ARN"
+    Value: !Ref OrderEventsTopic
+  
+  InventoryQueueUrl:
+    Description: "Inventory Queue URL"
+    Value: !GetAtt InventoryQueue.QueueUrl
